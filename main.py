@@ -1,43 +1,54 @@
 
 import os
-import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+BASE = "https://apiv2.nobitex.ir"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BASE = "https://data-api.binance.vision"
-TIMEOUT = 25
+TIMEOUT = 20
 
-session = requests.Session()
+S = requests.Session()
 
-def get_json(url, params=None):
-    response = session.get(url, params=params, timeout=TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-    if isinstance(data, dict) and "code" in data:
-        raise RuntimeError(f"Binance API error: {data}")
+def get_json(path, params=None):
+    r = S.get(BASE + path, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"Nobitex API error: {data}")
     return data
 
 def ema(values, period):
     k = 2 / (period + 1)
     result = values[0]
-    for value in values[1:]:
-        result = value * k + result * (1 - k)
+    for x in values[1:]:
+        result = x * k + result * (1 - k)
     return result
 
 def analyze(symbol):
     try:
+        import time
+        end = int(time.time())
+        start = end - 100 * 3600
+
         data = get_json(
-            f"{BASE}/api/v3/klines",
-            {"symbol": symbol, "interval": "1h", "limit": 100}
+            "/market/udf/history",
+            {
+                "symbol": symbol,
+                "resolution": "60",
+                "from": start,
+                "to": end
+            }
         )
 
-        if not isinstance(data, list) or len(data) < 50:
+        if data.get("s") != "ok" or len(data.get("c", [])) < 50:
             return None
 
-        # فقط کندل‌های بسته‌شده
-        closes = [float(row[4]) for row in data[:-1]]
+        # آخرین کندل ممکن است هنوز بسته نشده باشد
+        closes = [float(x) for x in data["c"][:-1]]
+
+        if len(closes) < 35:
+            return None
 
         fast = ema(closes[-50:], 9)
         slow = ema(closes[-50:], 21)
@@ -46,6 +57,7 @@ def analyze(symbol):
             closes[i] - closes[i - 1]
             for i in range(len(closes) - 14, len(closes))
         ]
+
         gains = [max(x, 0) for x in changes]
         losses = [abs(min(x, 0)) for x in changes]
 
@@ -66,55 +78,72 @@ def analyze(symbol):
         signal = ema(macd_values[-9:], 9)
         price = closes[-1]
 
-        if fast > slow and macd > signal and 50 <= rsi <= 68:
-            return f"🟢 BUY | {symbol}\nPrice: {price}\nRSI: {rsi:.1f}"
+        # نمونه سیگنال خرید
+        if fast > slow and macd > signal and 50 <= rsi <= 65:
+            stop = price * 0.98
+            target1 = price * 1.03
+            target2 = price * 1.05
 
-        if fast < slow and macd < signal and rsi < 48:
-            return f"🔴 SELL | {symbol}\nPrice: {price}\nRSI: {rsi:.1f}"
+            return (
+                f"🟢 BUY | {symbol}\n"
+                f"Price: {price:g}\n"
+                f"RSI: {rsi:.1f}\n"
+                f"Stop: {stop:g}\n"
+                f"Target 1: {target1:g}\n"
+                f"Target 2: {target2:g}"
+            )
 
-    except Exception as error:
-        print(f"Scan error {symbol}: {error}")
+        # سیگنال نزولی؛ هشدار بررسی فروش دارایی موجود
+        if fast < slow and macd < signal and rsi < 45:
+            return (
+                f"🔴 SELL WARNING | {symbol}\n"
+                f"Price: {price:g}\n"
+                f"RSI: {rsi:.1f}"
+            )
+
+    except Exception as e:
+        print(f"Error {symbol}: {e}")
 
     return None
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Telegram settings are missing")
+        raise RuntimeError("Telegram secrets missing")
 
-    response = requests.post(
+    r = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         data={"chat_id": CHAT_ID, "text": message},
         timeout=TIMEOUT
     )
 
-    print("Telegram status:", response.status_code)
-    print("Telegram response:", response.text)
-    response.raise_for_status()
+    print("Telegram status:", r.status_code)
+    print("Telegram response:", r.text)
+    r.raise_for_status()
 
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram did not accept the message")
+    if not r.json().get("ok"):
+        raise RuntimeError("Telegram rejected message")
 
 def main():
-    print("Starting Binance USDT scanner...")
+    print("Starting Nobitex scanner...")
 
-    info = get_json(f"{BASE}/api/v3/exchangeInfo")
+    stats = get_json("/market/stats")["stats"]
 
-    if not isinstance(info, dict) or "symbols" not in info:
-        raise RuntimeError(f"Unexpected exchangeInfo response: {info}")
+    symbols = []
+    for key, value in stats.items():
+        symbol = key.upper().replace("-", "")
+        if (
+            symbol.endswith("IRT") or symbol.endswith("USDT")
+        ) and not value.get("isClosed", True):
+            symbols.append(symbol)
 
-    symbols = [
-        item["symbol"]
-        for item in info["symbols"]
-        if item.get("status") == "TRADING"
-        and item.get("quoteAsset") == "USDT"
-        and item.get("isSpotTradingAllowed") is True
-    ]
-
-    print("USDT spot pairs found:", len(symbols))
+    symbols = sorted(set(symbols))
+    print("Active Nobitex markets:", len(symbols))
 
     signals = []
-    with ThreadPoolExecutor(max_workers=5) as pool:
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
         jobs = [pool.submit(analyze, symbol) for symbol in symbols]
+
         for job in as_completed(jobs):
             result = job.result()
             if result:
@@ -123,13 +152,17 @@ def main():
     print("Signals found:", len(signals))
 
     if signals:
-        message = "📊 Binance USDT Signals\n\n" + "\n\n".join(signals[:25])
+        message = "📊 NOBITEX SIGNALS\n\n"
+        message += "\n\n".join(signals[:20])
     else:
-        message = "📊 Crypto Scanner\n\nNo signals found in this scan."
+        message = (
+            "📊 NOBITEX SCANNER\n\n"
+            "No signals found in this scan."
+        )
 
     message += "\n\n⚠️ Analytical signals only. Not guaranteed."
     send_telegram(message)
-    print("Scanner finished successfully.")
+    print("Scanner completed.")
 
 if __name__ == "__main__":
     main()
