@@ -6,9 +6,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BASE = "https://data-api.binance.vision"
+TIMEOUT = 25
 
-BASE = "https://api.binance.com"
-TIMEOUT = 20
+session = requests.Session()
+
+def get_json(url, params=None):
+    response = session.get(url, params=params, timeout=TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, dict) and "code" in data:
+        raise RuntimeError(f"Binance API error: {data}")
+    return data
 
 def ema(values, period):
     k = 2 / (period + 1)
@@ -19,17 +28,16 @@ def ema(values, period):
 
 def analyze(symbol):
     try:
-        url = f"{BASE}/api/v3/klines"
-        data = requests.get(
-            url,
-            params={"symbol": symbol, "interval": "1h", "limit": 100},
-            timeout=TIMEOUT
-        ).json()
+        data = get_json(
+            f"{BASE}/api/v3/klines",
+            {"symbol": symbol, "interval": "1h", "limit": 100}
+        )
 
         if not isinstance(data, list) or len(data) < 50:
             return None
 
-        closes = [float(row[4]) for row in data]
+        # فقط کندل‌های بسته‌شده
+        closes = [float(row[4]) for row in data[:-1]]
 
         fast = ema(closes[-50:], 9)
         slow = ema(closes[-50:], 21)
@@ -43,22 +51,19 @@ def analyze(symbol):
 
         avg_gain = sum(gains) / 14
         avg_loss = sum(losses) / 14
-
-        if avg_loss == 0:
-            rsi = 100
-        else:
-            rsi = 100 - (100 / (1 + avg_gain / avg_loss))
+        rsi = 100 if avg_loss == 0 else (
+            100 - 100 / (1 + avg_gain / avg_loss)
+        )
 
         macd_values = []
         for i in range(34, len(closes)):
             part = closes[:i + 1]
             macd_values.append(
-                ema(part[-26:], 12) - ema(part[-26:], 26)
+                ema(part[-12:], 12) - ema(part[-26:], 26)
             )
 
         macd = macd_values[-1]
         signal = ema(macd_values[-9:], 9)
-
         price = closes[-1]
 
         if fast > slow and macd > signal and 50 <= rsi <= 68:
@@ -67,20 +72,17 @@ def analyze(symbol):
         if fast < slow and macd < signal and rsi < 48:
             return f"🔴 SELL | {symbol}\nPrice: {price}\nRSI: {rsi:.1f}"
 
-    except Exception:
-        return None
+    except Exception as error:
+        print(f"Scan error {symbol}: {error}")
 
     return None
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
-        print("ERROR: Telegram settings missing")
-        return
-
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        raise RuntimeError("Telegram settings are missing")
 
     response = requests.post(
-        url,
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         data={"chat_id": CHAT_ID, "text": message},
         timeout=TIMEOUT
     )
@@ -89,29 +91,30 @@ def send_telegram(message):
     print("Telegram response:", response.text)
     response.raise_for_status()
 
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram did not accept the message")
+
 def main():
     print("Starting Binance USDT scanner...")
 
-    info = requests.get(
-        f"{BASE}/api/v3/exchangeInfo",
-        timeout=TIMEOUT
-    ).json()
+    info = get_json(f"{BASE}/api/v3/exchangeInfo")
+
+    if not isinstance(info, dict) or "symbols" not in info:
+        raise RuntimeError(f"Unexpected exchangeInfo response: {info}")
 
     symbols = [
         item["symbol"]
         for item in info["symbols"]
-        if item["status"] == "TRADING"
-        and item["quoteAsset"] == "USDT"
-        and item["isSpotTradingAllowed"]
+        if item.get("status") == "TRADING"
+        and item.get("quoteAsset") == "USDT"
+        and item.get("isSpotTradingAllowed") is True
     ]
 
-    print("USDT pairs found:", len(symbols))
+    print("USDT spot pairs found:", len(symbols))
 
     signals = []
-
     with ThreadPoolExecutor(max_workers=5) as pool:
         jobs = [pool.submit(analyze, symbol) for symbol in symbols]
-
         for job in as_completed(jobs):
             result = job.result()
             if result:
@@ -120,16 +123,13 @@ def main():
     print("Signals found:", len(signals))
 
     if signals:
-        message = "📊 Crypto Scanner Signals\n\n"
-        message += "\n\n".join(signals[:25])
-        message += "\n\n⚠️ Analytical signals, not guaranteed."
+        message = "📊 Binance USDT Signals\n\n" + "\n\n".join(signals[:25])
     else:
-        message = (
-            "📊 Crypto Scanner\n\n"
-            "No signals found in this scan."
-        )
+        message = "📊 Crypto Scanner\n\nNo signals found in this scan."
 
+    message += "\n\n⚠️ Analytical signals only. Not guaranteed."
     send_telegram(message)
+    print("Scanner finished successfully.")
 
 if __name__ == "__main__":
     main()
